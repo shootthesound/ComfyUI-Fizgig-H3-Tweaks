@@ -1,17 +1,77 @@
 # Fizgig H3 Tweaks
 
-One training-free node for MiniMax H3 (category **Fizgig**): **Fizgig H3 Tweaks**. A model patch — put it after your LoRAs, before the sampler. Every control is off at 0 except High Freq Detail.
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/lorasandlenses)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-| Control | Default | What it does (tested 25 Sep 2026, 6-step Turbo, int8 base, 512x512x22) |
-|---|---|---|
-| **High Freq Detail** | 0.15 | Fine detail from the deep blocks on the late steps. Works in both directions: above 0 = crisper pores, freckles, lashes (0.15 is typically clean; higher adds more, and contrast pop by 0.6); below 0 = smoother, softer skin. |
-| **↳ High Freq Detail mode** | stable across frames | Sub-control of High Freq Detail only. *stable*: only detail that is the same in every frame (measured +7% shimmer at 0.3); *per frame*: each frame's own (+20% shimmer on clips — fine for stills). |
-| **Scene Variation** | 0 | A small re-roll of an almost-right render, like a sub-seed: nudges the layout on the first two steps while keeping the overall look. Small values = small changes. |
-| **Prompt Strength** | 0 | How much every video/audio token takes from the prompt (H3 Turbo has no CFG). Above 0: named things come through more strongly; below 0: looser. |
-| **report** | off | Console lines per step and block. |
+One node for **MiniMax H3** in ComfyUI that nudges what the model draws while it samples — no training, no extra models. Crisper or smoother skin, a gentle re-roll of an almost-right render, and a prompt-strength dial for H3's CFG-free Turbo renders.
 
-Where each control acts is fixed at the tested blocks/steps (High Freq Detail: blocks 40-49, steps 4+; Scene Variation: blocks 20-49, steps 1-2; Prompt Strength: everywhere). Two Tweaks nodes in a chain add together. Block Skip / Token Route on the same blocks are replaced by it there (ComfyUI allows one block patch).
+## How do I install it?
 
-## Example workflow
+```
+cd ComfyUI/custom_nodes
+git clone https://github.com/shootthesound/ComfyUI-Fizgig-H3-Tweaks
+```
 
-`example_workflows/h3_tweaks_text_to_video.json` (also in ComfyUI's Templates browser under this pack): ComfyUI's built-in **MiniMax H3: Text to Video** template flattened — the same model files and settings, every node on one canvas, no subgraph — with the Lightning LoRA on at 8 steps and Fizgig H3 Tweaks between the LoRA and the sampler. Rebuild it from the installed template with `dev/make_example.py`.
+Restart ComfyUI. The node is **Fizgig H3 Tweaks**, under the **Fizgig** category. No extra Python dependencies — it runs on ComfyUI's built-in MiniMax H3 support.
+
+## How do I use it?
+
+It's a model patch. Put it after your LoRAs and before the sampler:
+
+```
+Load Diffusion Model → (your LoRAs) → Fizgig H3 Tweaks → BasicGuider / BasicScheduler → SamplerCustomAdvanced
+```
+
+Every control except High Freq Detail starts at 0 (off), so turn on only what you need.
+
+## How do I get crisper skin — or smoother?
+
+**High Freq Detail** (default 0.15). It works in both directions:
+
+- **Above 0** — crisper pores, freckles and lashes. 0.15 is typically clean; higher adds more, and brings contrast and saturation pop by around 0.6.
+- **Below 0** — smoother, softer skin.
+
+Its sub-control, **↳ High Freq Detail mode**, matters on clips:
+
+- **stable across frames** (default) — only adds detail that is the same in every frame, so fine texture doesn't shimmer.
+- **per frame** — each frame's own detail. Fine for stills; on clips it can shimmer.
+
+## How do I re-roll a render that's almost right?
+
+**Scene Variation**. It works like a sub-seed: the scene rearranges a little while the overall look stays the same. Small values give small changes, and the same settings always give the same result. Try ±0.1 to ±0.3.
+
+## How do I make the prompt come through more strongly?
+
+**Prompt Strength**. H3's Turbo renders run without CFG, so there's normally no dial for how closely the model follows your prompt. Above 0, the things you name come through more strongly; below 0 the result is looser. Start around 0.2 and step up gradually.
+
+## Which models and settings does it work with?
+
+MiniMax H3 only (fl2va or ref2va) — the node tells you if another model is connected. It was tuned on 6-8 step Turbo / Lightning renders. The tweaks act on set sampling steps (detail from step 4 on, variation on the first two), so on a 20-step render without a Turbo LoRA High Freq Detail covers most of the render — use a lower value there.
+
+## Can I combine it with other nodes?
+
+Yes — it sits alongside LoRAs and any sampler. Two Fizgig H3 Tweaks nodes in a chain add together. Other nodes that replace H3's blocks (block-skipping nodes, for example) take over the blocks they share with it, so use one or the other on the same blocks.
+
+## Is there an example workflow?
+
+Yes: [`example_workflows/h3_tweaks_text_to_video.json`](example_workflows/) — ComfyUI's own **MiniMax H3: Text to Video** template with everything on one canvas (no subgraph), the Lightning LoRA on at 8 steps, and Fizgig H3 Tweaks between the LoRA and the sampler. Load it from ComfyUI's Templates browser (it appears under this pack's name), or drag the JSON onto the canvas. The models are the ones the template uses — see its *Model Links* note in ComfyUI's Templates browser.
+
+## Support
+
+If this tool saves you time or fits into your workflow, consider
+[buying me a coffee](https://buymeacoffee.com/lorasandlenses).
+
+Your support helps me keep developing and maintaining these nodes. Members get
+early access to new builds before public release.
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/lorasandlenses)
+
+## Author
+
+Peter Neill — [ShootTheSound.com](https://shootthesound.com) / [UltrawideWallpapers.net](https://ultrawidewallpapers.net)
+
+Feedback is welcome — open an issue or reach out.
+
+## License
+
+MIT
