@@ -123,22 +123,6 @@ def band(kind, d4, mode=None):
     raise ValueError(kind)
 
 
-_PUSH_CACHE = {}
-
-
-def _variation_push(d4, seed):
-    """A seeded, smooth (broad shapes only) field, the same in every frame, scaled to the RMS of
-    this update's own broad band — so a strength means about the same change whatever the seed."""
-    T, gh, gw, C = d4.shape
-    key = (int(seed), gh, gw, C, str(d4.device))
-    if key not in _PUSH_CACHE:
-        g = torch.Generator(device="cpu").manual_seed(int(seed))
-        z = _blur_grid(torch.randn((1, gh, gw, C), generator=g).to(d4.device), 3.0)
-        _PUSH_CACHE[key] = z / z.pow(2).mean().sqrt().clamp_min(1e-8)
-    low_rms = _blur_grid(d4, 3.0).pow(2).mean().sqrt()
-    return (_PUSH_CACHE[key] * low_rms).expand_as(d4)
-
-
 # ---- prompt strength: an attention module the block can use instead of its own ---------------
 class _PromptWeightedAttention:
     """Same maths as comfy.ldm.minimax.model.Attention.forward, with the text rows' values scaled."""
@@ -224,10 +208,7 @@ def make_dispatcher(dm):
         d4 = d.reshape(T, gh, gw, -1)
         new = d4
         for tw in updates:
-            if tw["kind"] == "composition" and tw.get("seed", 0):
-                new = new + tw["strength"] * _variation_push(d4, tw["seed"])
-            else:
-                new = new + tw["strength"] * band(tw["kind"], d4, tw.get("mode"))
+            new = new + tw["strength"] * band(tw["kind"], d4, tw.get("mode"))
         out[va:vb] = (h_in.float() + new.reshape(d.shape)).to(out.dtype)
         if report:
             print(f"[Fizgig H3 Tweaks] step {step}/{n} block {i}: "
@@ -310,11 +291,6 @@ class FizgigH3Tweaks(io.ComfyNode):
                                tooltip="A small re-roll of an almost-right render, like a sub-seed: nudges "
                                        "the layout on the first two steps while keeping the overall look. "
                                        "Small values = small changes; same settings = same result. 0 = off."),
-                io.Int.Input("variation_seed", display_name="  ↳ Scene Variation seed", default=0, min=0,
-                             max=0xffffffff,
-                             tooltip="Applies to Scene Variation only. 0: re-rolls along the layout the "
-                                     "model is already forming (one direction). 1 and up: each seed is a "
-                                     "different direction to re-roll in, at the same strength."),
                 io.Float.Input("prompt_strength", display_name="Prompt Strength", default=0.0, min=-0.5,
                                max=3.0, step=0.05,
                                tooltip="How much every video/audio token takes from the prompt (H3 Turbo has no "
@@ -326,10 +302,10 @@ class FizgigH3Tweaks(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, high_freq_detail=0.15, detail_mode="stable across frames", composition=0.0,
-                variation_seed=0, prompt_strength=0.0, report=False) -> io.NodeOutput:
+                prompt_strength=0.0, report=False) -> io.NodeOutput:
         t = [
             _tweak("detail", high_freq_detail, *WHERE["detail"], report, mode=detail_mode),
-            _tweak("composition", composition, *WHERE["composition"], report, seed=int(variation_seed)),
+            _tweak("composition", composition, *WHERE["composition"], report),
             _tweak("prompt", prompt_strength, *WHERE["prompt"], report),
         ]
         return io.NodeOutput(add_tweaks(model, t))
