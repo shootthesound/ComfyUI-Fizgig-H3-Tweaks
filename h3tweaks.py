@@ -1,28 +1,26 @@
 """Fizgig H3 Tweaks — training-free nudges to what MiniMax H3's blocks write, per step.
 
-A model patch (after your LoRAs, before the sampler). On the steps and blocks you name, each
-block's update to the VIDEO tokens (what the block adds to the stream) is re-weighted:
+A model patch (after your LoRAs, before the sampler). On the steps and blocks you name, the
+high-frequency part of each block's update to the VIDEO tokens (what the block adds to the
+stream, minus its Gaussian blur across neighbouring tokens) is scaled:
 
-- detail_gain: the whole update, scaled by (1 + gain). Aimed at the late steps and deep blocks,
-  where the fine structure is written (the Fizgig fine map, 24-25 Sep 2026: detail forms on the
-  last steps; the deep blocks carry the most and change the most). The FreeU idea — turn up the
-  part of the network that carries the look — aimed with a map instead of applied everywhere.
-- detail_hf_gain: only the high-frequency part of the update across each frame's token grid
-  (update minus its Gaussian blur over neighbouring tokens), scaled by (1 + gain). Sharper
-  local structure. One token covers 32x32 image pixels at 512, so this works at that scale;
-  texture finer than a token lives inside each token's features and is what detail_gain reaches.
+- High Freq Detail > 0: crisper fine structure — pores, freckles, lashes.
+- High Freq Detail < 0: smoother — softer skin, less texture.
 
-Text and audio rows are never touched. Both gains at 0 = the block unchanged, bit for bit.
+Aimed at the late steps and deep blocks, where fine structure is written (the Fizgig fine map,
+24-25 Sep 2026). One token covers 32x32 image pixels at 512; finer texture follows through the
+VAE decode. Text and audio rows are never touched; 0 leaves the model untouched.
+
 Tested 25 Sep 2026 (6-step Turbo @0.75, int8 base, 512x512x22, blocks 40-49, steps 4+, same
-seed): detail_hf_gain 0.3 = crisper pores / freckles / lashes with no crunch (the default);
-0.6 = clean but punchy (more contrast and saturation). detail_gain 0.1 = subtle and clean, 0.2 =
-grainy papery skin, 0.35 = broken. Both sit on a knife edge — go up in small steps.
+seed): +0.3 = crisper pores / freckles / lashes with no crunch; +0.6 = clean but punchy (more
+contrast and saturation); negative values smooth (Peter). Default +0.15. A whole-update gain was
+tried alongside and dropped — grainy by 0.2, broken by 0.35.
 """
 from __future__ import annotations
 
 import math
 import re
-from typing import Dict, Set
+from typing import Set
 
 import torch
 import torch.nn.functional as F
@@ -97,7 +95,7 @@ def _blur_grid(x, sigma=1.0):
     return y.reshape(T, C, h, w).permute(0, 2, 3, 1)
 
 
-def build_patch(blocks: Set[int], steps_spec: str, gain: float, hf_gain: float, report: bool):
+def build_patch(steps_spec: str, hf: float, report: bool):
     state = {"n": None, "steps": set(), "last": None, "hits": 0}
 
     def patch(args, extra):
@@ -112,18 +110,16 @@ def build_patch(blocks: Set[int], steps_spec: str, gain: float, hf_gain: float, 
         if step not in state["steps"]:
             return original(args)
         va, vb, _ = next(s for s in layout.segments if s[2] == "video")
+        _, T, lh, lw, _ = layout.signature
+        gh, gw = lh // 2, lw // 2                       # 2x2 patches -> token grid
+        if T * gh * gw != vb - va:
+            return original(args)
         h_in = args["img"][va:vb].clone()              # blocks update the stream in place
         out = original(args)["img"]
         delta = out[va:vb].float() - h_in.float()
-        new = delta * (1.0 + gain)
-        if hf_gain:
-            _, T, lh, lw, _ = layout.signature
-            gh, gw = lh // 2, lw // 2                   # 2x2 patches -> token grid
-            if T * gh * gw == delta.shape[0]:
-                d4 = delta.reshape(T, gh, gw, -1)
-                high = (d4 - _blur_grid(d4)).reshape(delta.shape)
-                new = new + hf_gain * high
-        out[va:vb] = (h_in.float() + new).to(out.dtype)
+        d4 = delta.reshape(T, gh, gw, -1)
+        high = (d4 - _blur_grid(d4)).reshape(delta.shape)
+        out[va:vb] = (h_in.float() + delta + hf * high).to(out.dtype)
         if report:
             if state["last"] != step:
                 if state["last"] is not None:
@@ -142,22 +138,20 @@ class FizgigH3Tweaks(io.ComfyNode):
             node_id="FizgigH3Tweaks",
             display_name="Fizgig H3 Tweaks",
             category="Fizgig",
-            search_aliases=["detail boost", "skin detail", "freeu", "sharpen", "minimax h3 detail"],
+            search_aliases=["detail boost", "skin detail", "smooth skin", "freeu", "sharpen",
+                            "minimax h3 detail"],
             description=(
-                "Training-free: turns up (or down) what chosen MiniMax H3 blocks write on chosen "
-                "steps. detail_gain scales the whole update of the late, deep blocks where fine "
-                "structure forms; detail_hf_gain scales only its high-frequency part. A model patch: "
-                "after your LoRAs, before the sampler. Experimental — start small."
+                "Training-free: scales the fine, high-frequency part of what MiniMax H3's deep "
+                "blocks write on the late steps. Above 0 = crisper detail (pores, freckles, lashes); "
+                "below 0 = smoother. A model patch: after your LoRAs, before the sampler."
             ),
             inputs=[
                 io.Model.Input("model", tooltip="The H3 model with any LoRAs applied."),
-                io.Float.Input("detail_gain", default=0.0, min=-0.3, max=0.3, step=0.01,
-                               tooltip="Scale the chosen blocks' whole update by (1 + this). 0 = off. "
-                                       "Tested: 0.1 is subtle and clean, 0.2 already grainy. Below 0: softer."),
-                io.Float.Input("detail_hf_gain", default=0.3, min=-1.0, max=1.0, step=0.05,
-                               tooltip="Gain on only the high-frequency part of the update (across "
-                                       "neighbouring tokens) - the skin lever. Tested: 0.2-0.4 = crisper "
-                                       "pores, freckles, lashes; 0.6 adds contrast and saturation pop. 0 = off."),
+                io.Float.Input("high_freq_detail", display_name="High Freq Detail",
+                               default=0.15, min=-1.0, max=1.0, step=0.05,
+                               tooltip="Above 0: crisper fine detail — 0.15-0.3 sharpens pores, "
+                                       "freckles and lashes cleanly; 0.6 adds contrast and saturation "
+                                       "pop. Below 0: smoother, softer skin. 0 = off."),
                 io.String.Input("blocks", default="40-49",
                                 tooltip="Which blocks (0-49), e.g. '40-49' or '30-49'. The deep blocks "
                                         "carry the fine structure."),
@@ -170,7 +164,7 @@ class FizgigH3Tweaks(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, detail_gain=0.0, detail_hf_gain=0.3, blocks="40-49", steps="4+",
+    def execute(cls, model, high_freq_detail=0.15, blocks="40-49", steps="4+",
                 report=False) -> io.NodeOutput:
         dm = getattr(getattr(model, "model", None), "diffusion_model", None)
         if dm is None or type(dm).__name__ != "MiniMaxH3Model":
@@ -178,8 +172,8 @@ class FizgigH3Tweaks(io.ComfyNode):
         bl = _parse_ranges(blocks, 0, NUM_BLOCKS - 1, "block"); bl.discard(-1)
         _parse_ranges(steps, 1, 10_000, "step")
         m = model.clone()
-        if bl and (detail_gain or detail_hf_gain):
-            patch = build_patch(bl, steps, float(detail_gain), float(detail_hf_gain), bool(report))
+        if bl and high_freq_detail:
+            patch = build_patch(steps, float(high_freq_detail), bool(report))
             existing = (m.model_options.get("transformer_options", {})
                         .get("patches_replace", {}).get("dit", {}))
             clash = sorted(i for i in bl if ("double_block", i) in existing)
