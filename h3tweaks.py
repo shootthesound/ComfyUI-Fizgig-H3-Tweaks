@@ -7,9 +7,9 @@ Route on the same blocks still replace it: ComfyUI allows one replace-patch per 
 
 Update tweaks re-weight a block's update to the VIDEO tokens (what the block adds, `d`), split
 into bands over each frame's token grid (one token = 32x32 image px at 512) or over time:
-  Detail          d_high = d - blur(d, 1 token)            (blocks 40-49, steps 4+)
+  Detail          d_high = d - blur(d, 1 token)            (blocks 40-49, sigma <= 0.94)
   Local Contrast  d_mid  = blur(d, 1) - blur(d, 3)         (40-49, 4+)
-  Composition     d_low  = blur(d, 3)                      (20-49, 1-2)
+  Composition     d_low  = blur(d, 3)                      (20-49, sigma >= 0.97)
   Motion          d_move = d - mean over frames of d       (20-49, 3-5)
 Each adds strength * band to d. Detail can instead use only the part of d_high that is the same
 in every frame ("stable across frames") — sharper without shimmer.
@@ -173,11 +173,13 @@ def make_dispatcher(dm):
             return original(args)
         i = int(to.get("block_index", -1))
         active = []
+        try:
+            sigma = float(to["sigmas"].flatten()[0])
+        except Exception:
+            return original(args)
         for tw in tweaks:
-            key = (id(tw), n)
-            if key not in cache:
-                cache[key] = _steps(tw["steps"], n)
-            if i in tw["blocks"] and step in cache[key]:
+            lo, hi = tw["sigma"]
+            if i in tw["blocks"] and lo <= sigma <= hi:
                 active.append(tw)
         if not active:
             return original(args)
@@ -246,19 +248,22 @@ def add_tweaks(model, tweaks, node_name="Fizgig H3 Tweaks"):
     return m
 
 
-def _tweak(kind, strength, blocks, steps, report, **extra):
+def _tweak(kind, strength, blocks, sigma, report, **extra):
     bl = _parse_ranges(blocks, 0, NUM_BLOCKS - 1, "block"); bl.discard(-1)
-    return dict(kind=kind, strength=float(strength), blocks=sorted(bl), steps=steps,
+    return dict(kind=kind, strength=float(strength), blocks=sorted(bl), sigma=tuple(sigma),
                 report=bool(report), **extra)
 
 
 # Where each control acts — fixed at the tested values (25 Sep 2026 live tests).
+# Where each control acts: blocks + a NOISE-LEVEL window (sigma, 1 = pure noise). Keyed to noise
+# level rather than step number, so it adapts to any step count (4, 6, 8, 20…) and to split
+# samplers. The thresholds reproduce the tested 6-step Turbo windows exactly (shift 12 sigmas
+# 1.0 .984 .960 | .923 .858 .706): detail = steps 4-6 there, the last ~half anywhere; scene
+# variation = steps 1-2 there, the first ~third anywhere.
 WHERE = {
-    "detail":      ("40-49", "4+"),    # fine structure is written by the deep blocks, late
-    "motion":      ("20-49", "3-5"),   # from step 3, so step 2's layout is left alone
-    "contrast":    ("40-49", "4+"),
-    "composition": ("20-49", "1-2"),   # the first steps set the layout
-    "prompt":      ("all", "all"),
+    "detail":      ("40-49", (0.0, 0.94)),   # fine structure: deep blocks, low noise
+    "composition": ("20-49", (0.97, 1.01)),  # the layout: the first, high-noise steps
+    "prompt":      ("all", (0.0, 1.01)),
 }
 
 
@@ -277,9 +282,10 @@ class FizgigH3Tweaks(io.ComfyNode):
                 io.Model.Input("model", tooltip="The H3 model with any LoRAs applied."),
                 io.Float.Input("high_freq_detail", display_name="High Freq Detail", default=0.15,
                                min=-1.0, max=1.0, step=0.05,
-                               tooltip="Fine detail from the deep blocks on the late steps. Works in both "
+                               tooltip="Fine detail from the deep blocks on the late steps (the last half or so, "
+                                       "whatever your step count). Works in both "
                                        "directions: above 0 = crisper pores, freckles, lashes (0.15 is "
-                                       "typically clean; higher adds more, and contrast pop by 0.6); below 0 "
+                                       "typically clean; higher can work but is often overbaked); below 0 "
                                        "= smoother, softer skin. 0 = off."),
                 io.Combo.Input("detail_mode", display_name="  ↳ High Freq Detail mode", options=list(DETAIL_MODES),
                                default="stable across frames",
@@ -290,7 +296,8 @@ class FizgigH3Tweaks(io.ComfyNode):
                 io.Float.Input("composition", display_name="Scene Variation", default=0.0, min=-0.5,
                                max=0.5, step=0.05,
                                tooltip="A small re-roll of an almost-right render, like a sub-seed: nudges "
-                                       "the layout on the first two steps while keeping the overall look. "
+                                       "the layout on the first steps (the first third or so, whatever your step count) "
+                                       "while keeping the overall look. "
                                        "Small values = small changes; same settings = same result. 0 = off."),
                 io.Float.Input("prompt_strength", display_name="Prompt Strength", default=0.0, min=-0.5,
                                max=3.0, step=0.05,

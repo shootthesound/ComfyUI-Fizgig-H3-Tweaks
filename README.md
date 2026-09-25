@@ -28,7 +28,7 @@ Every control except High Freq Detail starts at 0 (off), so turn on only what yo
 
 **High Freq Detail** (default 0.15). It works in both directions:
 
-- **Above 0** — crisper pores, freckles and lashes. 0.15 is typically clean; higher adds more, and brings contrast and saturation pop by around 0.6.
+- **Above 0** — crisper pores, freckles and lashes. 0.15 is typically clean; higher than 0.15 can work, but can often be overbaked.
 - **Below 0** — smoother, softer skin.
 
 Its sub-control, **↳ High Freq Detail mode**, matters on clips:
@@ -46,7 +46,7 @@ Its sub-control, **↳ High Freq Detail mode**, matters on clips:
 
 ## Which models and settings does it work with?
 
-MiniMax H3 only (fl2va or ref2va) — the node tells you if another model is connected. It was tuned on 6-8 step Turbo / Lightning renders. The tweaks act on set sampling steps (detail from step 4 on, variation on the first two), so on a 20-step render without a Turbo LoRA High Freq Detail covers most of the render — use a lower value there.
+MiniMax H3 only (fl2va or ref2va) — the node tells you if another model is connected. Any step count: the tweaks follow the render's noise level rather than step numbers, so they adapt on their own — High Freq Detail acts on roughly the last half of the steps, Scene Variation on roughly the first third (at 6 steps: 4-6 and 1-2; at 4 steps: 3-4 and 1-2; at 20 steps: 10-20 and 1-6). That also holds when a render is split across two samplers. It was tested on 6-step Turbo renders; on long renders without a Turbo LoRA the detail covers more steps, so a lower value may suit.
 
 ## Can I combine it with other nodes?
 
