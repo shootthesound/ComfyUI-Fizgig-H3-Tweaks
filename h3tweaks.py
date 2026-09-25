@@ -277,9 +277,10 @@ class FizgigH3Tweaks(io.ComfyNode):
                 io.Model.Input("model", tooltip="The H3 model with any LoRAs applied."),
                 io.Float.Input("high_freq_detail", display_name="High Freq Detail", default=0.15,
                                min=-1.0, max=1.0, step=0.05,
-                               tooltip="Fine detail from the deep blocks on the late steps. Above 0: crisper "
-                                       "pores, freckles, lashes (0.15-0.3 clean; 0.6 adds contrast pop). "
-                                       "Below 0: smoother, softer skin. 0 = off."),
+                               tooltip="Fine detail from the deep blocks on the late steps. Works in both "
+                                       "directions: above 0 = crisper pores, freckles, lashes (0.15 is "
+                                       "typically clean; higher adds more, and contrast pop by 0.6); below 0 "
+                                       "= smoother, softer skin. 0 = off."),
                 io.Combo.Input("detail_mode", display_name="  ↳ High Freq Detail mode", options=list(DETAIL_MODES),
                                default="stable across frames",
                                tooltip="Applies to High Freq Detail only (does nothing when it is 0). stable across frames: "
