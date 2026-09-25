@@ -11,3 +11,7 @@ One training-free node for MiniMax H3 (category **Fizgig**): **Fizgig H3 Tweaks*
 | **report** | off | Console lines per step and block. |
 
 Where each control acts is fixed at the tested blocks/steps (High Freq Detail: blocks 40-49, steps 4+; Scene Variation: blocks 20-49, steps 1-2; Prompt Strength: everywhere). Two Tweaks nodes in a chain add together. Block Skip / Token Route on the same blocks are replaced by it there (ComfyUI allows one block patch).
+
+## Example workflow
+
+`example_workflows/h3_tweaks_text_to_video.json` (also in ComfyUI's Templates browser under this pack): ComfyUI's built-in **MiniMax H3: Text to Video** template flattened — the same model files and settings, every node on one canvas, no subgraph — with the Lightning LoRA on at 8 steps and Fizgig H3 Tweaks between the LoRA and the sampler. Rebuild it from the installed template with `dev/make_example.py`.
