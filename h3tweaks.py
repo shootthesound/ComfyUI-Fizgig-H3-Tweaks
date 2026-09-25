@@ -1,20 +1,26 @@
 """Fizgig H3 Tweaks — training-free nudges to what MiniMax H3's blocks write, per step.
 
-A model patch (after your LoRAs, before the sampler). On the steps and blocks you name, the
-high-frequency part of each block's update to the VIDEO tokens (what the block adds to the
-stream, minus its Gaussian blur across neighbouring tokens) is scaled:
+Five model-patch nodes (after your LoRAs, before the sampler), freely chainable: each adds its
+tweak to a shared list in the model's transformer_options, and ONE dispatcher patch per block
+applies every listed tweak — so two tweak nodes never overwrite each other (Block Skip / Token
+Route on the same blocks still do: ComfyUI allows one replace-patch per block).
 
-- High Freq Detail > 0: crisper fine structure — pores, freckles, lashes.
-- High Freq Detail < 0: smoother — softer skin, less texture.
+Update tweaks re-weight a block's update to the VIDEO tokens (what the block adds, `d`), split
+into bands over each frame's token grid (one token = 32x32 image px at 512) or over time:
+  Detail          d_high = d - blur(d, 1 token)            (default blocks 40-49, steps 4+)
+  Local Contrast  d_mid  = blur(d, 1) - blur(d, 3)         (40-49, 4+)
+  Composition     d_low  = blur(d, 3)                      (20-49, 1-2)
+  Motion          d_move = d - mean over frames of d       (20-49, 2-5)
+Each adds strength * band to d. Detail can instead use only the part of d_high that is the same
+in every frame ("stable across frames") — sharper without shimmer.
+Prompt Strength works inside attention: the text tokens' values are scaled by (1 + strength), so
+every video (and audio) token takes proportionally more from the prompt. H3 Turbo runs without
+CFG; this is a CFG-free adherence dial.
 
-Aimed at the late steps and deep blocks, where fine structure is written (the Fizgig fine map,
-24-25 Sep 2026). One token covers 32x32 image pixels at 512; finer texture follows through the
-VAE decode. Text and audio rows are never touched; 0 leaves the model untouched.
-
-Tested 25 Sep 2026 (6-step Turbo @0.75, int8 base, 512x512x22, blocks 40-49, steps 4+, same
-seed): +0.3 = crisper pores / freckles / lashes with no crunch; +0.6 = clean but punchy (more
-contrast and saturation); negative values smooth (Peter). Default +0.15. A whole-update gain was
-tried alongside and dropped — grainy by 0.2, broken by 0.35.
+Text and audio rows are never modified by the update tweaks; everything at 0 = untouched.
+Tested 25 Sep 2026 (6-step Turbo @0.75, int8 base, 512x512x22): Detail +0.3 = crisper pores /
+freckles / lashes, no crunch; +0.6 punchy; negative smooths (Peter). Default +0.15. A whole-
+update gain was tried and dropped (grainy by 0.2, broken by 0.35). The other four: see README.
 """
 from __future__ import annotations
 
@@ -27,8 +33,11 @@ import torch.nn.functional as F
 from comfy_api.latest import io
 
 NUM_BLOCKS = 50
+KEY = "fizgig_h3_tweaks"
+DETAIL_MODES = ("per frame", "stable across frames")
 
 
+# ---- parsing / step detection ------------------------------------------------------------------
 def _parse_ranges(text: str, lo: int, hi: int, what: str) -> Set[int]:
     """'3-12, 14' -> {3..12, 14}; 'all'; '4+' = 4 to the end (returned with -1 marker)."""
     out: Set[int] = set()
@@ -79,6 +88,7 @@ def _step_index(to) -> tuple:
         return None, None
 
 
+# ---- bands ----------------------------------------------------------------------------------------
 def _blur_grid(x, sigma=1.0):
     """x [T, h, w, C] -> Gaussian blur over (h, w), reflect padding."""
     T, h, w, C = x.shape
@@ -95,91 +105,266 @@ def _blur_grid(x, sigma=1.0):
     return y.reshape(T, C, h, w).permute(0, 2, 3, 1)
 
 
-def build_patch(steps_spec: str, hf: float, report: bool):
-    state = {"n": None, "steps": set(), "last": None, "hits": 0}
+def band(kind, d4, mode=None):
+    """d4 [T, gh, gw, C] fp32 -> the band this tweak scales, same shape."""
+    if kind == "detail":
+        high = d4 - _blur_grid(d4, 1.0)
+        if mode == "stable across frames" and d4.shape[0] > 1:
+            high = high.mean(dim=0, keepdim=True).expand_as(high)
+        return high
+    if kind == "contrast":
+        return _blur_grid(d4, 1.0) - _blur_grid(d4, 3.0)
+    if kind == "composition":
+        return _blur_grid(d4, 3.0)
+    if kind == "motion":
+        return d4 - d4.mean(dim=0, keepdim=True) if d4.shape[0] > 1 else torch.zeros_like(d4)
+    raise ValueError(kind)
 
-    def patch(args, extra):
+
+# ---- prompt strength: an attention module the block can use instead of its own ---------------
+class _PromptWeightedAttention:
+    """Same maths as comfy.ldm.minimax.model.Attention.forward, with the text rows' values scaled."""
+
+    def __init__(self, attn, text_len, scale):
+        self.attn, self.text_len, self.scale = attn, text_len, scale
+
+    def __call__(self, x, rope_freqs=None, transformer_options={}):
+        import comfy.model_management
+        import comfy.quant_ops
+        from comfy.ldm.modules.attention import optimized_attention
+        from comfy.ldm.minimax.model import AttentionTensorContainer
+        a = self.attn
+        s = x.shape[0]
+        q, k, v = a.qkv_proj(x).split(a.heads * a.head_dim, dim=-1)
+        v = v.reshape(s, a.heads, a.head_dim).clone()
+        v[: self.text_len] *= self.scale
+        if rope_freqs is not None:
+            q = q.reshape(1, s, a.heads, a.head_dim).contiguous()
+            k = k.reshape(1, s, a.heads, a.head_dim).contiguous()
+            qw = comfy.model_management.cast_to(a.q_norm.weight, device=x.device)
+            kw = comfy.model_management.cast_to(a.k_norm.weight, device=x.device)
+            rot = rope_freqs.shape[-3] * 2
+            q, k = comfy.quant_ops.ck.rms_rope_split_half(q, k, rope_freqs, qw, kw, epsilon=a.q_norm.eps, rot_dim=rot)
+            q, k = q[0], k[0]
+        else:
+            q = a.q_norm(q.reshape(s, a.heads, a.head_dim))
+            k = a.k_norm(k.reshape(s, a.heads, a.head_dim))
+        q = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
+        k = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
+        v = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
+        out = optimized_attention(q, k, v, a.heads, mask=None, skip_reshape=True,
+                                  transformer_options=transformer_options)
+        return a.out_proj(out.squeeze(0))
+
+
+# ---- the dispatcher ------------------------------------------------------------------------------
+def make_dispatcher(dm):
+    cache = {}
+
+    def dispatch(args, extra):
         original = extra["original_block"]
         to = args.get("transformer_options", {})
-        step, n = _step_index(to)
+        tweaks = to.get(KEY) or []
         layout = args.get("layout")
-        if step is None or layout is None:
+        step, n = _step_index(to)
+        if not tweaks or step is None or layout is None:
             return original(args)
-        if state["n"] != n:
-            state.update(n=n, steps=_steps(steps_spec, n), last=None, hits=0)
-        if step not in state["steps"]:
+        i = int(to.get("block_index", -1))
+        active = []
+        for tw in tweaks:
+            key = (id(tw), n)
+            if key not in cache:
+                cache[key] = _steps(tw["steps"], n)
+            if i in tw["blocks"] and step in cache[key]:
+                active.append(tw)
+        if not active:
             return original(args)
+        report = any(tw.get("report") for tw in active)
+        call = dict(args)
+        prompt = [tw for tw in active if tw["kind"] == "prompt"]
+        if prompt:
+            text_len = next((b - a for a, b, kind in layout.segments if kind == "text"), 0)
+            scale = 1.0
+            for tw in prompt:
+                scale *= 1.0 + tw["strength"]
+            if text_len and scale != 1.0:
+                call["attention"] = _PromptWeightedAttention(dm.blocks[i].attn, text_len, scale)
+        updates = [tw for tw in active if tw["kind"] != "prompt"]
+        if not updates:
+            out = original(call)
+            if report:
+                print(f"[Fizgig H3 Tweaks] step {step}/{n} block {i}: prompt x{scale:.2f}", flush=True)
+            return out
         va, vb, _ = next(s for s in layout.segments if s[2] == "video")
         _, T, lh, lw, _ = layout.signature
-        gh, gw = lh // 2, lw // 2                       # 2x2 patches -> token grid
+        gh, gw = lh // 2, lw // 2                         # 2x2 patches -> token grid
         if T * gh * gw != vb - va:
-            return original(args)
-        h_in = args["img"][va:vb].clone()              # blocks update the stream in place
-        out = original(args)["img"]
-        delta = out[va:vb].float() - h_in.float()
-        d4 = delta.reshape(T, gh, gw, -1)
-        high = (d4 - _blur_grid(d4)).reshape(delta.shape)
-        out[va:vb] = (h_in.float() + delta + hf * high).to(out.dtype)
+            return original(call)
+        h_in = args["img"][va:vb].clone()                # blocks update the stream in place
+        out = original(call)["img"]
+        d = out[va:vb].float() - h_in.float()
+        d4 = d.reshape(T, gh, gw, -1)
+        new = d4
+        for tw in updates:
+            new = new + tw["strength"] * band(tw["kind"], d4, tw.get("mode"))
+        out[va:vb] = (h_in.float() + new.reshape(d.shape)).to(out.dtype)
         if report:
-            if state["last"] != step:
-                if state["last"] is not None:
-                    print(f"[Fizgig H3 Tweaks] step {state['last']}/{n}: {state['hits']} block(s) tweaked", flush=True)
-                state.update(last=step, hits=0)
-            state["hits"] += 1
+            print(f"[Fizgig H3 Tweaks] step {step}/{n} block {i}: "
+                  + ", ".join(f"{tw['kind']} {tw['strength']:+.2f}" for tw in updates), flush=True)
         return {"img": out}
 
-    return patch
+    return dispatch
 
 
+def add_tweak(model, tweak, node_name):
+    dm = getattr(getattr(model, "model", None), "diffusion_model", None)
+    if dm is None or type(dm).__name__ != "MiniMaxH3Model":
+        raise ValueError(f"{node_name} only knows MiniMax H3 — connect an H3 model.")
+    m = model.clone()
+    if not tweak["blocks"] or tweak["strength"] == 0:
+        return m
+    to = m.model_options.setdefault("transformer_options", {})
+    to[KEY] = list(to.get(KEY) or []) + [tweak]
+    existing = to.get("patches_replace", {}).get("dit", {})
+    foreign = sorted(i for i in tweak["blocks"] if ("double_block", i) in existing
+                     and getattr(existing[("double_block", i)], "_fizgig_tweaks", False) is False)
+    if foreign:
+        print(f"[{node_name}] note: blocks {foreign} carry another node's patch (Block Skip / Token "
+              "Route?); the tweaks replace it there.", flush=True)
+    patch = make_dispatcher(dm)
+    patch._fizgig_tweaks = True
+    blocks = set(tweak["blocks"])
+    for tw in to[KEY]:
+        blocks |= set(tw["blocks"])
+    for i in sorted(blocks):
+        m.set_model_patch_replace(patch, "dit", "double_block", i)
+    return m
+
+
+def _tweak(kind, strength, blocks, steps, report, **extra):
+    bl = _parse_ranges(blocks, 0, NUM_BLOCKS - 1, "block"); bl.discard(-1)
+    _parse_ranges(steps, 1, 10_000, "step")
+    return dict(kind=kind, strength=float(strength), blocks=sorted(bl), steps=steps,
+                report=bool(report), **extra)
+
+
+def _common(blocks, steps):
+    return [
+        io.String.Input("blocks", default=blocks, tooltip="Which blocks (0-49), e.g. '40-49', '20-49', 'all'."),
+        io.String.Input("steps", default=steps, tooltip="Which sampling steps (from 1): '4+' = step 4 to the end, "
+                                                        "'1-2', 'all'. Early steps set composition and motion; "
+                                                        "late steps write detail."),
+        io.Boolean.Input("report", default=False, tooltip="Console lines per step and block."),
+    ]
+
+
+# ---- the five nodes -------------------------------------------------------------------------------
 class FizgigH3Tweaks(io.ComfyNode):
+    """Detail. Node id kept from the first release so saved workflows still find it."""
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="FizgigH3Tweaks",
-            display_name="Fizgig H3 Tweaks",
-            category="Fizgig",
-            search_aliases=["detail boost", "skin detail", "smooth skin", "freeu", "sharpen",
-                            "minimax h3 detail"],
-            description=(
-                "Training-free: scales the fine, high-frequency part of what MiniMax H3's deep "
-                "blocks write on the late steps. Above 0 = crisper detail (pores, freckles, lashes); "
-                "below 0 = smoother. A model patch: after your LoRAs, before the sampler."
-            ),
-            inputs=[
-                io.Model.Input("model", tooltip="The H3 model with any LoRAs applied."),
-                io.Float.Input("high_freq_detail", display_name="High Freq Detail",
-                               default=0.15, min=-1.0, max=1.0, step=0.05,
-                               tooltip="Above 0: crisper fine detail — 0.15-0.3 sharpens pores, "
-                                       "freckles and lashes cleanly; 0.6 adds contrast and saturation "
-                                       "pop. Below 0: smoother, softer skin. 0 = off."),
-                io.String.Input("blocks", default="40-49",
-                                tooltip="Which blocks (0-49), e.g. '40-49' or '30-49'. The deep blocks "
-                                        "carry the fine structure."),
-                io.String.Input("steps", default="4+",
-                                tooltip="Which sampling steps (from 1), e.g. '4+' = step 4 to the end. "
-                                        "Late steps are where detail forms; early steps set composition."),
-                io.Boolean.Input("report", default=False, tooltip="One console line per step."),
-            ],
-            outputs=[io.Model.Output(display_name="model")],
-        )
+            node_id="FizgigH3Tweaks", display_name="Fizgig H3 Detail", category="Fizgig",
+            search_aliases=["detail boost", "skin detail", "smooth skin", "freeu", "sharpen", "fizgig h3 tweaks"],
+            description="Scales the fine, high-frequency part of what H3's deep blocks write on the late steps. "
+                        "Above 0 = crisper pores, freckles, lashes; below 0 = smoother. Chainable with the "
+                        "other Fizgig H3 tweak nodes.",
+            inputs=[io.Model.Input("model"),
+                    io.Float.Input("high_freq_detail", display_name="High Freq Detail", default=0.15,
+                                   min=-1.0, max=1.0, step=0.05,
+                                   tooltip="Above 0: crisper detail — 0.15-0.3 clean; 0.6 adds contrast and "
+                                           "saturation pop. Below 0: smoother, softer skin. 0 = off.")]
+                   + _common("40-49", "4+")
+                   + [io.Combo.Input("detail_mode", options=list(DETAIL_MODES), default=DETAIL_MODES[0],
+                                     tooltip="per frame: each frame's own fine detail. stable across frames: "
+                                             "only detail that is the same in every frame — no shimmer on clips.")],
+            outputs=[io.Model.Output(display_name="model")])
 
     @classmethod
-    def execute(cls, model, high_freq_detail=0.15, blocks="40-49", steps="4+",
-                report=False) -> io.NodeOutput:
-        dm = getattr(getattr(model, "model", None), "diffusion_model", None)
-        if dm is None or type(dm).__name__ != "MiniMaxH3Model":
-            raise ValueError("Fizgig H3 Tweaks only knows MiniMax H3 — connect an H3 model.")
-        bl = _parse_ranges(blocks, 0, NUM_BLOCKS - 1, "block"); bl.discard(-1)
-        _parse_ranges(steps, 1, 10_000, "step")
-        m = model.clone()
-        if bl and high_freq_detail:
-            patch = build_patch(steps, float(high_freq_detail), bool(report))
-            existing = (m.model_options.get("transformer_options", {})
-                        .get("patches_replace", {}).get("dit", {}))
-            clash = sorted(i for i in bl if ("double_block", i) in existing)
-            if clash:
-                print(f"[Fizgig H3 Tweaks] note: blocks {clash} were already patched (Block Skip / "
-                      "Token Route?); this node replaces those patches there.", flush=True)
-            for i in sorted(bl):
-                m.set_model_patch_replace(patch, "dit", "double_block", i)
-        return io.NodeOutput(m)
+    def execute(cls, model, high_freq_detail=0.15, blocks="40-49", steps="4+", report=False,
+                detail_mode=DETAIL_MODES[0]) -> io.NodeOutput:
+        return io.NodeOutput(add_tweak(model, _tweak("detail", high_freq_detail, blocks, steps, report,
+                                                     mode=detail_mode), "Fizgig H3 Detail"))
+
+
+class FizgigH3Motion(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="FizgigH3Motion", display_name="Fizgig H3 Motion", category="Fizgig",
+            search_aliases=["more motion", "less motion", "calm", "lively", "movement"],
+            description="Scales the part of each block's update that differs between frames — the motion. "
+                        "Above 0 = livelier; below 0 = calmer, steadier. Chainable. Experimental.",
+            inputs=[io.Model.Input("model"),
+                    io.Float.Input("motion", default=0.3, min=-1.0, max=1.0, step=0.05,
+                                   tooltip="Above 0: more movement. Below 0: calmer, steadier clips. 0 = off.")]
+                   + _common("20-49", "2-5"),
+            outputs=[io.Model.Output(display_name="model")])
+
+    @classmethod
+    def execute(cls, model, motion=0.3, blocks="20-49", steps="2-5", report=False) -> io.NodeOutput:
+        return io.NodeOutput(add_tweak(model, _tweak("motion", motion, blocks, steps, report), "Fizgig H3 Motion"))
+
+
+class FizgigH3LocalContrast(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="FizgigH3LocalContrast", display_name="Fizgig H3 Local Contrast", category="Fizgig",
+            search_aliases=["local contrast", "clarity", "pop", "microcontrast"],
+            description="Scales a middle band of what the deep blocks write late — local contrast and 'pop', "
+                        "coarser than Detail's texture. Below 0 = flatter, softer. Chainable. Experimental.",
+            inputs=[io.Model.Input("model"),
+                    io.Float.Input("local_contrast", default=0.2, min=-1.0, max=1.0, step=0.05,
+                                   tooltip="Above 0: punchier local contrast. Below 0: flatter. 0 = off.")]
+                   + _common("40-49", "4+"),
+            outputs=[io.Model.Output(display_name="model")])
+
+    @classmethod
+    def execute(cls, model, local_contrast=0.2, blocks="40-49", steps="4+", report=False) -> io.NodeOutput:
+        return io.NodeOutput(add_tweak(model, _tweak("contrast", local_contrast, blocks, steps, report),
+                                       "Fizgig H3 Local Contrast"))
+
+
+class FizgigH3Composition(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="FizgigH3Composition", display_name="Fizgig H3 Composition", category="Fizgig",
+            search_aliases=["bold composition", "layout", "shapes", "boldness"],
+            description="Scales the broad, low-frequency part of what blocks write on the first steps — bolder "
+                        "shapes and layout. Early steps set the framing, so small values. Chainable. Experimental.",
+            inputs=[io.Model.Input("model"),
+                    io.Float.Input("boldness", default=0.15, min=-0.5, max=0.5, step=0.05,
+                                   tooltip="Above 0: bolder shapes, stronger layout. Below 0: softer, flatter. "
+                                           "Framing can shift — start small. 0 = off.")]
+                   + _common("20-49", "1-2"),
+            outputs=[io.Model.Output(display_name="model")])
+
+    @classmethod
+    def execute(cls, model, boldness=0.15, blocks="20-49", steps="1-2", report=False) -> io.NodeOutput:
+        return io.NodeOutput(add_tweak(model, _tweak("composition", boldness, blocks, steps, report),
+                                       "Fizgig H3 Composition"))
+
+
+class FizgigH3PromptStrength(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="FizgigH3PromptStrength", display_name="Fizgig H3 Prompt Strength", category="Fizgig",
+            search_aliases=["prompt adherence", "cfg free", "prompt weight", "follow prompt"],
+            description="Makes every video and audio token take more (or less) from the prompt, inside attention. "
+                        "H3 Turbo runs without CFG — this is a CFG-free adherence dial. Chainable. Experimental.",
+            inputs=[io.Model.Input("model"),
+                    io.Float.Input("prompt_strength", default=0.2, min=-0.5, max=1.0, step=0.05,
+                                   tooltip="Above 0: follows the prompt harder. Below 0: looser. 0 = off.")]
+                   + _common("all", "all"),
+            outputs=[io.Model.Output(display_name="model")])
+
+    @classmethod
+    def execute(cls, model, prompt_strength=0.2, blocks="all", steps="all", report=False) -> io.NodeOutput:
+        return io.NodeOutput(add_tweak(model, _tweak("prompt", prompt_strength, blocks, steps, report),
+                                       "Fizgig H3 Prompt Strength"))
+
+
+NODES = [FizgigH3Tweaks, FizgigH3Motion, FizgigH3LocalContrast, FizgigH3Composition, FizgigH3PromptStrength]

@@ -8,8 +8,8 @@ from comfy_api.latest import ComfyExtension
 
 class FizgigH3TweaksExtension(ComfyExtension):
     async def get_node_list(self):
-        from .h3tweaks import FizgigH3Tweaks
-        return [FizgigH3Tweaks]
+        from .h3tweaks import NODES
+        return list(NODES)
 
 
 async def comfy_entrypoint() -> FizgigH3TweaksExtension:
