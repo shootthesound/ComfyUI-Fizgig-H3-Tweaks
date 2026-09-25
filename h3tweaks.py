@@ -7,9 +7,9 @@ Route on the same blocks still replace it: ComfyUI allows one replace-patch per 
 
 Update tweaks re-weight a block's update to the VIDEO tokens (what the block adds, `d`), split
 into bands over each frame's token grid (one token = 32x32 image px at 512) or over time:
-  Detail          d_high = d - blur(d, 1 token)            (blocks 40-49, sigma <= 0.94)
+  Detail          d_high = d - blur(d, 1 token)            (blocks 40-49, last half of the steps)
   Local Contrast  d_mid  = blur(d, 1) - blur(d, 3)         (40-49, 4+)
-  Composition     d_low  = blur(d, 3)                      (20-49, sigma >= 0.97)
+  Composition     d_low  = blur(d, 3)                      (20-49, first third of the steps)
   Motion          d_move = d - mean over frames of d       (20-49, 3-5)
 Each adds strength * band to d. Detail can instead use only the part of d_high that is the same
 in every frame ("stable across frames") — sharper without shimmer.
@@ -173,13 +173,8 @@ def make_dispatcher(dm):
             return original(args)
         i = int(to.get("block_index", -1))
         active = []
-        try:
-            sigma = float(to["sigmas"].flatten()[0])
-        except Exception:
-            return original(args)
         for tw in tweaks:
-            lo, hi = tw["sigma"]
-            if i in tw["blocks"] and lo <= sigma <= hi:
+            if i in tw["blocks"] and step in _window(tw["window"], n):
                 active.append(tw)
         if not active:
             return original(args)
@@ -248,23 +243,31 @@ def add_tweaks(model, tweaks, node_name="Fizgig H3 Tweaks"):
     return m
 
 
-def _tweak(kind, strength, blocks, sigma, report, **extra):
+def _tweak(kind, strength, blocks, window, report, **extra):
     bl = _parse_ranges(blocks, 0, NUM_BLOCKS - 1, "block"); bl.discard(-1)
-    return dict(kind=kind, strength=float(strength), blocks=sorted(bl), sigma=tuple(sigma),
+    return dict(kind=kind, strength=float(strength), blocks=sorted(bl), window=window,
                 report=bool(report), **extra)
 
 
 # Where each control acts — fixed at the tested values (25 Sep 2026 live tests).
-# Where each control acts: blocks + a NOISE-LEVEL window (sigma, 1 = pure noise). Keyed to noise
-# level rather than step number, so it adapts to any step count (4, 6, 8, 20…) and to split
-# samplers. The thresholds reproduce the tested 6-step Turbo windows exactly (shift 12 sigmas
-# 1.0 .984 .960 | .923 .858 .706): detail = steps 4-6 there, the last ~half anywhere; scene
-# variation = steps 1-2 there, the first ~third anywhere.
+# Where each control acts: blocks + a window of the sampler's own steps, scaled to however many
+# steps it runs (read from the schedule every step). Detail = the last half, Scene Variation = the
+# first third rounded up — at the tested 6 steps exactly 4-6 and 1-2; 4 steps 3-4 / 1-2; 8 steps
+# 5-8 / 1-3; 20 steps 11-20 / 1-7. With a render split over two samplers, each counts its own.
 WHERE = {
-    "detail":      ("40-49", (0.0, 0.94)),   # fine structure: deep blocks, low noise
-    "composition": ("20-49", (0.97, 1.01)),  # the layout: the first, high-noise steps
-    "prompt":      ("all", (0.0, 1.01)),
+    "detail":      ("40-49", "last half"),     # fine structure: deep blocks, late steps
+    "composition": ("20-49", "first third"),   # the layout: the first steps
+    "prompt":      ("all", "all"),
 }
+
+
+def _window(kind, n):
+    """Step numbers (1-based) of an n-step sampler that a window covers."""
+    if kind == "last half":
+        return set(range(n // 2 + 1, n + 1))
+    if kind == "first third":
+        return set(range(1, math.ceil(n / 3) + 1))
+    return set(range(1, n + 1))
 
 
 # ---- the node -----------------------------------------------------------------------------------

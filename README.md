@@ -46,7 +46,7 @@ Its sub-control, **↳ High Freq Detail mode**, matters on clips:
 
 ## Which models and settings does it work with?
 
-MiniMax H3 only (fl2va or ref2va) — the node tells you if another model is connected. Any step count: the tweaks follow the render's noise level rather than step numbers, so they adapt on their own — High Freq Detail acts on roughly the last half of the steps, Scene Variation on roughly the first third (at 6 steps: 4-6 and 1-2; at 4 steps: 3-4 and 1-2; at 20 steps: 10-20 and 1-6). That also holds when a render is split across two samplers. It was tested on 6-step Turbo renders; on long renders without a Turbo LoRA the detail covers more steps, so a lower value may suit.
+MiniMax H3 only (fl2va or ref2va) — the node tells you if another model is connected. Any step count: it reads how many steps your sampler runs and scales to it — High Freq Detail acts on the last half of the steps, Scene Variation on the first third (at 6 steps: 4-6 and 1-2; at 4 steps: 3-4 and 1-2; at 8 steps: 5-8 and 1-3; at 20 steps: 11-20 and 1-7). With a render split across two samplers, each sampler counts its own steps. It was tested on 6-step Turbo renders; on long renders without a Turbo LoRA the detail covers more steps, so a lower value may suit.
 
 ## Can I combine it with other nodes?
 
