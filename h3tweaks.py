@@ -1,16 +1,16 @@
 """Fizgig H3 Tweaks — training-free nudges to what MiniMax H3's blocks write, per step.
 
-Five model-patch nodes (after your LoRAs, before the sampler), freely chainable: each adds its
-tweak to a shared list in the model's transformer_options, and ONE dispatcher patch per block
-applies every listed tweak — so two tweak nodes never overwrite each other (Block Skip / Token
-Route on the same blocks still do: ComfyUI allows one replace-patch per block).
+One model-patch node (after your LoRAs, before the sampler) with five controls, each off at 0.
+Active controls go into a shared list in the model's transformer_options and ONE dispatcher
+patch per block applies them all — chaining two Tweaks nodes adds both lists (Block Skip / Token
+Route on the same blocks still replace it: ComfyUI allows one replace-patch per block).
 
 Update tweaks re-weight a block's update to the VIDEO tokens (what the block adds, `d`), split
 into bands over each frame's token grid (one token = 32x32 image px at 512) or over time:
-  Detail          d_high = d - blur(d, 1 token)            (default blocks 40-49, steps 4+)
+  Detail          d_high = d - blur(d, 1 token)            (blocks 40-49, steps 4+)
   Local Contrast  d_mid  = blur(d, 1) - blur(d, 3)         (40-49, 4+)
   Composition     d_low  = blur(d, 3)                      (20-49, 1-2)
-  Motion          d_move = d - mean over frames of d       (20-49, 2-5)
+  Motion          d_move = d - mean over frames of d       (20-49, 3-5)
 Each adds strength * band to d. Detail can instead use only the part of d_high that is the same
 in every frame ("stable across frames") — sharper without shimmer.
 Prompt Strength works inside attention: the text tokens' values are scaled by (1 + strength), so
@@ -20,7 +20,9 @@ CFG; this is a CFG-free adherence dial.
 Text and audio rows are never modified by the update tweaks; everything at 0 = untouched.
 Tested 25 Sep 2026 (6-step Turbo @0.75, int8 base, 512x512x22): Detail +0.3 = crisper pores /
 freckles / lashes, no crunch; +0.6 punchy; negative smooths (Peter). Default +0.15. A whole-
-update gain was tried and dropped (grainy by 0.2, broken by 0.35). The other four: see README.
+update gain was tried and dropped (grainy by 0.2, broken by 0.35). Round 2 (22 renders): Local Contrast clean
+and gentle; Prompt Strength promising; Motion's calm side works (-0.5 = -76% motion), its lively
+side smears (capped at +0.2); Composition reshuffled the layout rather than bolding it.
 """
 from __future__ import annotations
 
@@ -216,26 +218,29 @@ def make_dispatcher(dm):
     return dispatch
 
 
-def add_tweak(model, tweak, node_name):
+def add_tweaks(model, tweaks, node_name="Fizgig H3 Tweaks"):
+    """Append the active tweaks to the model's shared list and route their blocks through one
+    dispatcher. Chaining two Tweaks nodes adds both lists."""
     dm = getattr(getattr(model, "model", None), "diffusion_model", None)
     if dm is None or type(dm).__name__ != "MiniMaxH3Model":
         raise ValueError(f"{node_name} only knows MiniMax H3 — connect an H3 model.")
     m = model.clone()
-    if not tweak["blocks"] or tweak["strength"] == 0:
+    tweaks = [t for t in tweaks if t["blocks"] and t["strength"] != 0]
+    if not tweaks:
         return m
     to = m.model_options.setdefault("transformer_options", {})
-    to[KEY] = list(to.get(KEY) or []) + [tweak]
+    to[KEY] = list(to.get(KEY) or []) + tweaks
     existing = to.get("patches_replace", {}).get("dit", {})
-    foreign = sorted(i for i in tweak["blocks"] if ("double_block", i) in existing
+    blocks = set()
+    for tw in to[KEY]:
+        blocks |= set(tw["blocks"])
+    foreign = sorted(i for i in blocks if ("double_block", i) in existing
                      and getattr(existing[("double_block", i)], "_fizgig_tweaks", False) is False)
     if foreign:
         print(f"[{node_name}] note: blocks {foreign} carry another node's patch (Block Skip / Token "
               "Route?); the tweaks replace it there.", flush=True)
     patch = make_dispatcher(dm)
     patch._fizgig_tweaks = True
-    blocks = set(tweak["blocks"])
-    for tw in to[KEY]:
-        blocks |= set(tw["blocks"])
     for i in sorted(blocks):
         m.set_model_patch_replace(patch, "dit", "double_block", i)
     return m
@@ -243,128 +248,75 @@ def add_tweak(model, tweak, node_name):
 
 def _tweak(kind, strength, blocks, steps, report, **extra):
     bl = _parse_ranges(blocks, 0, NUM_BLOCKS - 1, "block"); bl.discard(-1)
-    _parse_ranges(steps, 1, 10_000, "step")
     return dict(kind=kind, strength=float(strength), blocks=sorted(bl), steps=steps,
                 report=bool(report), **extra)
 
 
-def _common(blocks, steps):
-    return [
-        io.String.Input("blocks", default=blocks, tooltip="Which blocks (0-49), e.g. '40-49', '20-49', 'all'."),
-        io.String.Input("steps", default=steps, tooltip="Which sampling steps (from 1): '4+' = step 4 to the end, "
-                                                        "'1-2', 'all'. Early steps set composition and motion; "
-                                                        "late steps write detail."),
-        io.Boolean.Input("report", default=False, tooltip="Console lines per step and block."),
-    ]
+# Where each control acts — fixed at the tested values (25 Sep 2026 live tests).
+WHERE = {
+    "detail":      ("40-49", "4+"),    # fine structure is written by the deep blocks, late
+    "motion":      ("20-49", "3-5"),   # from step 3, so step 2's layout is left alone
+    "contrast":    ("40-49", "4+"),
+    "composition": ("20-49", "1-2"),   # the first steps set the layout
+    "prompt":      ("all", "all"),
+}
 
 
-# ---- the five nodes -------------------------------------------------------------------------------
+# ---- the node -----------------------------------------------------------------------------------
 class FizgigH3Tweaks(io.ComfyNode):
-    """Detail. Node id kept from the first release so saved workflows still find it."""
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="FizgigH3Tweaks", display_name="Fizgig H3 Detail", category="Fizgig",
-            search_aliases=["detail boost", "skin detail", "smooth skin", "freeu", "sharpen", "fizgig h3 tweaks"],
-            description="Scales the fine, high-frequency part of what H3's deep blocks write on the late steps. "
-                        "Above 0 = crisper pores, freckles, lashes; below 0 = smoother. Chainable with the "
-                        "other Fizgig H3 tweak nodes.",
-            inputs=[io.Model.Input("model"),
-                    io.Float.Input("high_freq_detail", display_name="High Freq Detail", default=0.15,
-                                   min=-1.0, max=1.0, step=0.05,
-                                   tooltip="Above 0: crisper detail — 0.15-0.3 clean; 0.6 adds contrast and "
-                                           "saturation pop. Below 0: smoother, softer skin. 0 = off.")]
-                   + _common("40-49", "4+")
-                   + [io.Combo.Input("detail_mode", options=list(DETAIL_MODES), default=DETAIL_MODES[0],
-                                     tooltip="per frame: each frame's own fine detail. stable across frames: "
-                                             "only detail that is the same in every frame — no shimmer on clips.")],
+            node_id="FizgigH3Tweaks", display_name="Fizgig H3 Tweaks", category="Fizgig",
+            search_aliases=["detail boost", "skin detail", "smooth skin", "freeu", "sharpen", "motion",
+                            "calm", "local contrast", "composition", "prompt strength", "prompt adherence"],
+            description="Training-free nudges for MiniMax H3, each off at 0: fine detail, motion, local "
+                        "contrast, composition, prompt strength. A model patch: after your LoRAs, before "
+                        "the sampler. Experimental — start small.",
+            inputs=[
+                io.Model.Input("model", tooltip="The H3 model with any LoRAs applied."),
+                io.Float.Input("high_freq_detail", display_name="High Freq Detail", default=0.15,
+                               min=-1.0, max=1.0, step=0.05,
+                               tooltip="Fine detail from the deep blocks on the late steps. Above 0: crisper "
+                                       "pores, freckles, lashes (0.15-0.3 clean; 0.6 adds contrast pop). "
+                                       "Below 0: smoother, softer skin. 0 = off."),
+                io.Combo.Input("detail_mode", display_name="Detail mode", options=list(DETAIL_MODES),
+                               default="stable across frames",
+                               tooltip="stable across frames: only detail that is the same in every frame — "
+                                       "measured +7% shimmer at 0.3 vs +20% per frame. per frame: each "
+                                       "frame's own detail (fine for stills)."),
+                io.Float.Input("motion", display_name="Motion", default=0.0, min=-1.0, max=0.2, step=0.05,
+                               tooltip="Below 0: calmer, steadier clips (-0.5 measured -76% motion, clean). "
+                                       "Above 0 smears quickly, so it stops at +0.2. Acts from step 3. 0 = off."),
+                io.Float.Input("local_contrast", display_name="Local Contrast", default=0.0, min=-1.0, max=1.0,
+                               step=0.05,
+                               tooltip="Mid-band punch, coarser than detail. Above 0: more pop; below 0: "
+                                       "flatter. Gentle — +0.5 is still subtle. 0 = off."),
+                io.Float.Input("composition", display_name="Composition", default=0.0, min=-0.5, max=0.5,
+                               step=0.05,
+                               tooltip="The broad layout on the first two steps. In testing it reshuffled the "
+                                       "scene (like a nearby seed) rather than making it bolder — try it and "
+                                       "see. 0 = off."),
+                io.Float.Input("prompt_strength", display_name="Prompt Strength", default=0.0, min=-0.5,
+                               max=1.0, step=0.05,
+                               tooltip="How much every video/audio token takes from the prompt (H3 Turbo has no "
+                                       "CFG). Above 0: named things come through more strongly; below 0: "
+                                       "looser. 0 = off."),
+                io.Boolean.Input("report", default=False, tooltip="Console lines per step and block."),
+            ],
             outputs=[io.Model.Output(display_name="model")])
 
     @classmethod
-    def execute(cls, model, high_freq_detail=0.15, blocks="40-49", steps="4+", report=False,
-                detail_mode=DETAIL_MODES[0]) -> io.NodeOutput:
-        return io.NodeOutput(add_tweak(model, _tweak("detail", high_freq_detail, blocks, steps, report,
-                                                     mode=detail_mode), "Fizgig H3 Detail"))
+    def execute(cls, model, high_freq_detail=0.15, detail_mode="stable across frames", motion=0.0,
+                local_contrast=0.0, composition=0.0, prompt_strength=0.0, report=False) -> io.NodeOutput:
+        t = [
+            _tweak("detail", high_freq_detail, *WHERE["detail"], report, mode=detail_mode),
+            _tweak("motion", motion, *WHERE["motion"], report),
+            _tweak("contrast", local_contrast, *WHERE["contrast"], report),
+            _tweak("composition", composition, *WHERE["composition"], report),
+            _tweak("prompt", prompt_strength, *WHERE["prompt"], report),
+        ]
+        return io.NodeOutput(add_tweaks(model, t))
 
 
-class FizgigH3Motion(io.ComfyNode):
-    @classmethod
-    def define_schema(cls):
-        return io.Schema(
-            node_id="FizgigH3Motion", display_name="Fizgig H3 Motion", category="Fizgig",
-            search_aliases=["more motion", "less motion", "calm", "lively", "movement"],
-            description="Scales the part of each block's update that differs between frames — the motion. "
-                        "Above 0 = livelier; below 0 = calmer, steadier. Chainable. Experimental.",
-            inputs=[io.Model.Input("model"),
-                    io.Float.Input("motion", default=0.3, min=-1.0, max=1.0, step=0.05,
-                                   tooltip="Above 0: more movement. Below 0: calmer, steadier clips. 0 = off.")]
-                   + _common("20-49", "2-5"),
-            outputs=[io.Model.Output(display_name="model")])
-
-    @classmethod
-    def execute(cls, model, motion=0.3, blocks="20-49", steps="2-5", report=False) -> io.NodeOutput:
-        return io.NodeOutput(add_tweak(model, _tweak("motion", motion, blocks, steps, report), "Fizgig H3 Motion"))
-
-
-class FizgigH3LocalContrast(io.ComfyNode):
-    @classmethod
-    def define_schema(cls):
-        return io.Schema(
-            node_id="FizgigH3LocalContrast", display_name="Fizgig H3 Local Contrast", category="Fizgig",
-            search_aliases=["local contrast", "clarity", "pop", "microcontrast"],
-            description="Scales a middle band of what the deep blocks write late — local contrast and 'pop', "
-                        "coarser than Detail's texture. Below 0 = flatter, softer. Chainable. Experimental.",
-            inputs=[io.Model.Input("model"),
-                    io.Float.Input("local_contrast", default=0.2, min=-1.0, max=1.0, step=0.05,
-                                   tooltip="Above 0: punchier local contrast. Below 0: flatter. 0 = off.")]
-                   + _common("40-49", "4+"),
-            outputs=[io.Model.Output(display_name="model")])
-
-    @classmethod
-    def execute(cls, model, local_contrast=0.2, blocks="40-49", steps="4+", report=False) -> io.NodeOutput:
-        return io.NodeOutput(add_tweak(model, _tweak("contrast", local_contrast, blocks, steps, report),
-                                       "Fizgig H3 Local Contrast"))
-
-
-class FizgigH3Composition(io.ComfyNode):
-    @classmethod
-    def define_schema(cls):
-        return io.Schema(
-            node_id="FizgigH3Composition", display_name="Fizgig H3 Composition", category="Fizgig",
-            search_aliases=["bold composition", "layout", "shapes", "boldness"],
-            description="Scales the broad, low-frequency part of what blocks write on the first steps — bolder "
-                        "shapes and layout. Early steps set the framing, so small values. Chainable. Experimental.",
-            inputs=[io.Model.Input("model"),
-                    io.Float.Input("boldness", default=0.15, min=-0.5, max=0.5, step=0.05,
-                                   tooltip="Above 0: bolder shapes, stronger layout. Below 0: softer, flatter. "
-                                           "Framing can shift — start small. 0 = off.")]
-                   + _common("20-49", "1-2"),
-            outputs=[io.Model.Output(display_name="model")])
-
-    @classmethod
-    def execute(cls, model, boldness=0.15, blocks="20-49", steps="1-2", report=False) -> io.NodeOutput:
-        return io.NodeOutput(add_tweak(model, _tweak("composition", boldness, blocks, steps, report),
-                                       "Fizgig H3 Composition"))
-
-
-class FizgigH3PromptStrength(io.ComfyNode):
-    @classmethod
-    def define_schema(cls):
-        return io.Schema(
-            node_id="FizgigH3PromptStrength", display_name="Fizgig H3 Prompt Strength", category="Fizgig",
-            search_aliases=["prompt adherence", "cfg free", "prompt weight", "follow prompt"],
-            description="Makes every video and audio token take more (or less) from the prompt, inside attention. "
-                        "H3 Turbo runs without CFG — this is a CFG-free adherence dial. Chainable. Experimental.",
-            inputs=[io.Model.Input("model"),
-                    io.Float.Input("prompt_strength", default=0.2, min=-0.5, max=1.0, step=0.05,
-                                   tooltip="Above 0: follows the prompt harder. Below 0: looser. 0 = off.")]
-                   + _common("all", "all"),
-            outputs=[io.Model.Output(display_name="model")])
-
-    @classmethod
-    def execute(cls, model, prompt_strength=0.2, blocks="all", steps="all", report=False) -> io.NodeOutput:
-        return io.NodeOutput(add_tweak(model, _tweak("prompt", prompt_strength, blocks, steps, report),
-                                       "Fizgig H3 Prompt Strength"))
-
-
-NODES = [FizgigH3Tweaks, FizgigH3Motion, FizgigH3LocalContrast, FizgigH3Composition, FizgigH3PromptStrength]
+NODES = [FizgigH3Tweaks]
