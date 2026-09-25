@@ -316,7 +316,7 @@ class FizgigH3Tweaks(io.ComfyNode):
                                      "model is already forming (one direction). 1 and up: each seed is a "
                                      "different direction to re-roll in, at the same strength."),
                 io.Float.Input("prompt_strength", display_name="Prompt Strength", default=0.0, min=-0.5,
-                               max=1.0, step=0.05,
+                               max=3.0, step=0.05,
                                tooltip="How much every video/audio token takes from the prompt (H3 Turbo has no "
                                        "CFG). Above 0: named things come through more strongly; below 0: "
                                        "looser. 0 = off."),
