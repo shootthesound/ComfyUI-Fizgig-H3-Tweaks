@@ -278,21 +278,21 @@ class FizgigH3Tweaks(io.ComfyNode):
             node_id="FizgigH3Tweaks", display_name="Fizgig H3 Tweaks", category="Fizgig",
             search_aliases=["detail boost", "skin detail", "smooth skin", "freeu", "sharpen", "motion",
                             "calm", "local contrast", "composition", "prompt strength", "prompt adherence"],
-            description="Training-free nudges for MiniMax H3: fine detail (skin), scene variation (a "
+            description="Training-free nudges for MiniMax H3: detail & contrast, scene variation (a "
                         "sub-seed re-roll), prompt strength. A model patch: after your LoRAs, before "
                         "the sampler. Experimental — start small.",
             inputs=[
                 io.Model.Input("model", tooltip="The H3 model with any LoRAs applied."),
-                io.Float.Input("high_freq_detail", display_name="High Freq Detail", default=0.15,
+                io.Float.Input("high_freq_detail", display_name="Detail & Contrast", default=0.15,
                                min=-1.0, max=1.0, step=0.05,
-                               tooltip="Fine detail from the deep blocks on the late steps (the last half or so, "
-                                       "whatever your step count). Works in both "
-                                       "directions: above 0 = crisper pores, freckles, lashes (0.15 is "
-                                       "typically clean; higher can work but is often overbaked); below 0 "
-                                       "= smoother, softer skin. 0 = off."),
-                io.Combo.Input("detail_mode", display_name="  ↳ High Freq Detail mode", options=list(DETAIL_MODES),
+                               tooltip="Texture and local contrast together, on the late steps (the last half, "
+                                       "whatever your step count). Above 0 = crisper and punchier: more pores, "
+                                       "freckles and lashes, deeper shadows (0.15 is typically clean; higher can "
+                                       "work but is often overbaked). Below 0 = softer and airier: smoother skin, "
+                                       "lifted shadows. 0 = off."),
+                io.Combo.Input("detail_mode", display_name="  ↳ Detail & Contrast mode", options=list(DETAIL_MODES),
                                default="stable across frames",
-                               tooltip="Applies to High Freq Detail only (does nothing when it is 0). stable across frames: "
+                               tooltip="Applies to Detail & Contrast only (does nothing when it is 0). stable across frames: "
                                        "only detail that is the same in every frame — "
                                        "measured +7% shimmer at 0.3 vs +20% per frame. per frame: each "
                                        "frame's own detail (fine for stills)."),

@@ -3,7 +3,7 @@
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/lorasandlenses)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-One node for **MiniMax H3** in ComfyUI that nudges what the model draws while it samples — no training, no extra models. Crisper or smoother skin, a gentle re-roll of an almost-right render, and a prompt-strength dial for H3's CFG-free Turbo renders.
+One node for **MiniMax H3** in ComfyUI that nudges what the model draws while it samples — no training, no extra models. Detail and contrast in one dial (crisper and punchier, or softer and airier), a gentle re-roll of an almost-right render, and a prompt-strength dial for H3's CFG-free Turbo renders.
 
 ## How do I install it?
 
@@ -22,16 +22,16 @@ It's a model patch. Put it after your LoRAs and before the sampler:
 Load Diffusion Model → (your LoRAs) → Fizgig H3 Tweaks → BasicGuider / BasicScheduler → SamplerCustomAdvanced
 ```
 
-Every control except High Freq Detail starts at 0 (off), so turn on only what you need.
+Every control except Detail & Contrast starts at 0 (off), so turn on only what you need.
 
-## How do I get crisper skin — or smoother?
+## How do I get crisper skin — or a softer, airier look?
 
-**High Freq Detail** (default 0.15). It works in both directions:
+**Detail & Contrast** (default 0.15). It moves texture and local contrast together, in both directions:
 
-- **Above 0** — crisper pores, freckles and lashes. 0.15 is typically clean; higher than 0.15 can work, but can often be overbaked.
-- **Below 0** — smoother, softer skin.
+- **Above 0 — crisper and punchier.** More pores, freckles and lashes, and deeper shadows. 0.15 is typically clean; higher than 0.15 can work, but can often be overbaked.
+- **Below 0 — softer and airier.** Smoother skin and lifted shadows, which can flatter a shot.
 
-Its sub-control, **↳ High Freq Detail mode**, matters on clips:
+Its sub-control, **↳ Detail & Contrast mode**, matters on clips:
 
 - **stable across frames** (default) — only adds detail that is the same in every frame, so fine texture doesn't shimmer.
 - **per frame** — each frame's own detail. Fine for stills; on clips it can shimmer.
@@ -46,7 +46,7 @@ Its sub-control, **↳ High Freq Detail mode**, matters on clips:
 
 ## Which models and settings does it work with?
 
-MiniMax H3 only (fl2va or ref2va) — the node tells you if another model is connected. Any step count: it reads how many steps your sampler runs and scales to it — High Freq Detail acts on the last half of the steps, Scene Variation on the first third (at 6 steps: 4-6 and 1-2; at 4 steps: 3-4 and 1-2; at 8 steps: 5-8 and 1-3; at 20 steps: 11-20 and 1-7). With a render split across two samplers, each sampler counts its own steps. It was tested on 6-step Turbo renders; on long renders without a Turbo LoRA the detail covers more steps, so a lower value may suit.
+MiniMax H3 only (fl2va or ref2va) — the node tells you if another model is connected. Any step count: it reads how many steps your sampler runs and scales to it — Detail & Contrast acts on the last half of the steps, Scene Variation on the first third (at 6 steps: 4-6 and 1-2; at 4 steps: 3-4 and 1-2; at 8 steps: 5-8 and 1-3; at 20 steps: 11-20 and 1-7). With a render split across two samplers, each sampler counts its own steps. It was tested on 6-step Turbo renders; on long renders without a Turbo LoRA Detail & Contrast covers more steps, so a lower value may suit.
 
 ## Can I combine it with other nodes?
 

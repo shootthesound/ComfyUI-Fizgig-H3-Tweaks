@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-fizgig-h3-tweaks"
-description = "Training-free tweaks for MiniMax H3: crisper or smoother skin, a sub-seed style scene re-roll, and a prompt-strength dial for CFG-free Turbo renders. One node, no extra models."
-version = "1.0.1"
+description = "Training-free tweaks for MiniMax H3: detail and contrast in one dial, a sub-seed style scene re-roll, and a prompt-strength dial for CFG-free Turbo renders. One node, no extra models."
+version = "1.0.2"
 license = { text = "MIT" }
 dependencies = []
 
