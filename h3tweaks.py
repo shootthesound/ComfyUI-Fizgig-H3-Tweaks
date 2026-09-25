@@ -123,6 +123,22 @@ def band(kind, d4, mode=None):
     raise ValueError(kind)
 
 
+_PUSH_CACHE = {}
+
+
+def _variation_push(d4, seed):
+    """A seeded, smooth (broad shapes only) field, the same in every frame, scaled to the RMS of
+    this update's own broad band — so a strength means about the same change whatever the seed."""
+    T, gh, gw, C = d4.shape
+    key = (int(seed), gh, gw, C, str(d4.device))
+    if key not in _PUSH_CACHE:
+        g = torch.Generator(device="cpu").manual_seed(int(seed))
+        z = _blur_grid(torch.randn((1, gh, gw, C), generator=g).to(d4.device), 3.0)
+        _PUSH_CACHE[key] = z / z.pow(2).mean().sqrt().clamp_min(1e-8)
+    low_rms = _blur_grid(d4, 3.0).pow(2).mean().sqrt()
+    return (_PUSH_CACHE[key] * low_rms).expand_as(d4)
+
+
 # ---- prompt strength: an attention module the block can use instead of its own ---------------
 class _PromptWeightedAttention:
     """Same maths as comfy.ldm.minimax.model.Attention.forward, with the text rows' values scaled."""
@@ -208,7 +224,10 @@ def make_dispatcher(dm):
         d4 = d.reshape(T, gh, gw, -1)
         new = d4
         for tw in updates:
-            new = new + tw["strength"] * band(tw["kind"], d4, tw.get("mode"))
+            if tw["kind"] == "composition" and tw.get("seed", 0):
+                new = new + tw["strength"] * _variation_push(d4, tw["seed"])
+            else:
+                new = new + tw["strength"] * band(tw["kind"], d4, tw.get("mode"))
         out[va:vb] = (h_in.float() + new.reshape(d.shape)).to(out.dtype)
         if report:
             print(f"[Fizgig H3 Tweaks] step {step}/{n} block {i}: "
@@ -270,8 +289,8 @@ class FizgigH3Tweaks(io.ComfyNode):
             node_id="FizgigH3Tweaks", display_name="Fizgig H3 Tweaks", category="Fizgig",
             search_aliases=["detail boost", "skin detail", "smooth skin", "freeu", "sharpen", "motion",
                             "calm", "local contrast", "composition", "prompt strength", "prompt adherence"],
-            description="Training-free nudges for MiniMax H3, each off at 0: fine detail, motion, local "
-                        "contrast, composition, prompt strength. A model patch: after your LoRAs, before "
+            description="Training-free nudges for MiniMax H3: fine detail (skin), scene variation (a "
+                        "sub-seed re-roll), prompt strength. A model patch: after your LoRAs, before "
                         "the sampler. Experimental — start small.",
             inputs=[
                 io.Model.Input("model", tooltip="The H3 model with any LoRAs applied."),
@@ -286,18 +305,16 @@ class FizgigH3Tweaks(io.ComfyNode):
                                        "only detail that is the same in every frame — "
                                        "measured +7% shimmer at 0.3 vs +20% per frame. per frame: each "
                                        "frame's own detail (fine for stills)."),
-                io.Float.Input("motion", display_name="Motion", default=0.0, min=-1.0, max=0.2, step=0.05,
-                               tooltip="Below 0: calmer, steadier clips (-0.5 measured -76% motion, clean). "
-                                       "Above 0 smears quickly, so it stops at +0.2. Acts from step 3. 0 = off."),
-                io.Float.Input("local_contrast", display_name="Local Contrast", default=0.0, min=-1.0, max=1.0,
-                               step=0.05,
-                               tooltip="Mid-band punch, coarser than detail. Above 0: more pop; below 0: "
-                                       "flatter. Gentle — +0.5 is still subtle. 0 = off."),
-                io.Float.Input("composition", display_name="Composition", default=0.0, min=-0.5, max=0.5,
-                               step=0.05,
-                               tooltip="The broad layout on the first two steps. In testing it reshuffled the "
-                                       "scene (like a nearby seed) rather than making it bolder — try it and "
-                                       "see. 0 = off."),
+                io.Float.Input("composition", display_name="Scene Variation", default=0.0, min=-0.5,
+                               max=0.5, step=0.05,
+                               tooltip="A small re-roll of an almost-right render, like a sub-seed: nudges "
+                                       "the layout on the first two steps while keeping the overall look. "
+                                       "Small values = small changes; same settings = same result. 0 = off."),
+                io.Int.Input("variation_seed", display_name="  ↳ Scene Variation seed", default=0, min=0,
+                             max=0xffffffff,
+                             tooltip="Applies to Scene Variation only. 0: re-rolls along the layout the "
+                                     "model is already forming (one direction). 1 and up: each seed is a "
+                                     "different direction to re-roll in, at the same strength."),
                 io.Float.Input("prompt_strength", display_name="Prompt Strength", default=0.0, min=-0.5,
                                max=1.0, step=0.05,
                                tooltip="How much every video/audio token takes from the prompt (H3 Turbo has no "
@@ -308,13 +325,11 @@ class FizgigH3Tweaks(io.ComfyNode):
             outputs=[io.Model.Output(display_name="model")])
 
     @classmethod
-    def execute(cls, model, high_freq_detail=0.15, detail_mode="stable across frames", motion=0.0,
-                local_contrast=0.0, composition=0.0, prompt_strength=0.0, report=False) -> io.NodeOutput:
+    def execute(cls, model, high_freq_detail=0.15, detail_mode="stable across frames", composition=0.0,
+                variation_seed=0, prompt_strength=0.0, report=False) -> io.NodeOutput:
         t = [
             _tweak("detail", high_freq_detail, *WHERE["detail"], report, mode=detail_mode),
-            _tweak("motion", motion, *WHERE["motion"], report),
-            _tweak("contrast", local_contrast, *WHERE["contrast"], report),
-            _tweak("composition", composition, *WHERE["composition"], report),
+            _tweak("composition", composition, *WHERE["composition"], report, seed=int(variation_seed)),
             _tweak("prompt", prompt_strength, *WHERE["prompt"], report),
         ]
         return io.NodeOutput(add_tweaks(model, t))
