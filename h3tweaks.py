@@ -280,9 +280,10 @@ class FizgigH3Tweaks(io.ComfyNode):
                                tooltip="Fine detail from the deep blocks on the late steps. Above 0: crisper "
                                        "pores, freckles, lashes (0.15-0.3 clean; 0.6 adds contrast pop). "
                                        "Below 0: smoother, softer skin. 0 = off."),
-                io.Combo.Input("detail_mode", display_name="Detail mode", options=list(DETAIL_MODES),
+                io.Combo.Input("detail_mode", display_name="  ↳ High Freq Detail mode", options=list(DETAIL_MODES),
                                default="stable across frames",
-                               tooltip="stable across frames: only detail that is the same in every frame — "
+                               tooltip="Applies to High Freq Detail only (does nothing when it is 0). stable across frames: "
+                                       "only detail that is the same in every frame — "
                                        "measured +7% shimmer at 0.3 vs +20% per frame. per frame: each "
                                        "frame's own detail (fine for stills)."),
                 io.Float.Input("motion", display_name="Motion", default=0.0, min=-1.0, max=0.2, step=0.05,
